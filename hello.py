@@ -76,27 +76,29 @@ def find_top_left_start_candidates(image):
     # Find possible starting locations
     indices = np.where(image == 1)
 
+    # Tuning param, the kernels seem to begin too early
+    indices[0][:] = indices[0][:] + 2
+    indices[1][:] = indices[1][:] + 1
+
     return image, indices
 
 def calculate_start_indicator_boxes(image_binary, top_left_start_indices):
     # Attempts to find the start indicator boxes by looking at the diagonal size and start indice
-    # Returns matrix containing rows of: StartX, StartY, EndX, EndY, MidX, MidY, Width, Height
+    # Returns matrix containing rows of: StartX, StartY, EndX, EndY, MidX, MidY, Width, Height, IDBitWidth
 
     maxIndices = 1000
-    boxInformation = np.zeros((maxIndices, 8), dtype=np.int32)
+    boxInformation = np.zeros((maxIndices, 9), dtype=np.int32)
     nextIndiceId = 0
+    idBitWidthRelation = 0.75
 
     # Find the initial set of candidates
     for index in range(len(top_left_start_indices[0])):
         rightX = top_left_start_indices[1][index]
         bottomY = top_left_start_indices[0][index]
         diagonalSize = 1
-        whiteStepsRemaining = 3
+        whiteStepsStart = 3
+        whiteStepsRemaining = whiteStepsStart
         cancelSearch = False
-
-        # Filter out any potential boxes if the starting position is too close to a box already identified
-        if np.any(abs(boxInformation[np.where(abs(boxInformation[:, 0] - rightX) < 15), 1] - bottomY) < 15):
-            cancelSearch = True
         
         while whiteStepsRemaining > 0 and nextIndiceId < maxIndices and cancelSearch == False:
             newX = rightX + 1
@@ -106,8 +108,8 @@ def calculate_start_indicator_boxes(image_binary, top_left_start_indices):
             if image_binary[newY, newX]:
                 whiteStepsRemaining = whiteStepsRemaining - 1
             else:
-                whiteStepsRemaining = 3
-            if whiteStepsRemaining > 0:
+                whiteStepsRemaining = whiteStepsStart
+            if whiteStepsRemaining == whiteStepsStart:
                 rightX = newX
                 bottomY = newY
                 diagonalSize = diagonalSize + 1
@@ -120,7 +122,8 @@ def calculate_start_indicator_boxes(image_binary, top_left_start_indices):
                 top_left_start_indices[1][index] + ((rightX - top_left_start_indices[1][index]) / 2),
                 top_left_start_indices[0][index] + ((bottomY - top_left_start_indices[0][index]) / 2),
                 rightX - top_left_start_indices[1][index],
-                bottomY - top_left_start_indices[0][index]
+                bottomY - top_left_start_indices[0][index],
+                (rightX - top_left_start_indices[1][index]) * idBitWidthRelation
             ])
             boxInformation[nextIndiceId] = entry
             nextIndiceId = nextIndiceId + 1
@@ -138,10 +141,21 @@ def mean_pixel_intensity(image, startX, startY, endX, endY):
     height = endY - startY
     return np.sum(image[np.ix_(range(startY, endY), range(startX, endX))]) / (width * height)
 
-def filter_start_indicator_boxes(image, start_indicator_boxes):
+def filter_start_indicator_boxes_duplicates(image, start_indicator_boxes):
+    # Removes boxes which have close to the same starting position
+    filtered_boxes = np.zeros((0, start_indicator_boxes.shape[1]), dtype=np.int32)
+    for boxID in range(start_indicator_boxes.shape[0]):
+        checkBox = start_indicator_boxes[boxID]
+        startX = checkBox[0]
+        startY = checkBox[1]
+        if np.any(abs(filtered_boxes[np.where(abs(filtered_boxes[:, 0] - startX) < 15), 1] - startY) < 15) == False:
+            filtered_boxes = np.append(filtered_boxes, checkBox.reshape((1, start_indicator_boxes.shape[1])), 0)
+
+    return filtered_boxes
+
+def filter_start_indicator_boxes_whitesurround(image, start_indicator_boxes):
     # Tests the start indicator boxes against the expected shape of the start indicator and filters out incorrect candidates
     brightnessCutoff = 0.75
-    idBitWidthRelation = 0.75
     acceptableIDs = []
     imageWidth = image.shape[1]
     imageHeight = image.shape[0]
@@ -151,7 +165,7 @@ def filter_start_indicator_boxes(image, start_indicator_boxes):
         idWidth = start_indicator_boxes[boxID, 6]
         midY = start_indicator_boxes[boxID, 5]
         idHeight = start_indicator_boxes[boxID, 7]
-        bitWidth = math.floor(idWidth * idBitWidthRelation)
+        bitWidth = start_indicator_boxes[boxID, 8]
         bitHalfWidth = math.floor(bitWidth * 0.5)
         # Check image size restrictions
         if idEndX + (bitWidth * 13) >= imageWidth or idStartX - (idWidth * 2) < 0 or midY - (idHeight * 3) < 0 or midY + (idHeight * 3) >= imageHeight:
@@ -185,7 +199,7 @@ def filter_start_indicator_boxes(image, start_indicator_boxes):
 def locate_ids(image):
     # The convolution kernels are only good for IDs of a certain size range. Scale down a few times for better results.
     rescales = [1, 0.5, 0.25, 0.125]
-    start_indicator_boxes = np.zeros((0, 8))
+    start_indicator_boxes = np.zeros((0, 9))
 
     for imageScale in rescales:
         if imageScale == 1:
@@ -195,17 +209,29 @@ def locate_ids(image):
         image_binary = threshold_otsu(scaledImage) < scaledImage
         top_left_image, top_left_start_indices = find_top_left_start_candidates(scaledImage)
         scaled_start_indicator_boxes = calculate_start_indicator_boxes(image_binary, top_left_start_indices)
-        scaled_start_indicator_boxes = filter_start_indicator_boxes(scaledImage, scaled_start_indicator_boxes)
-        start_indicator_boxes = np.append(start_indicator_boxes, np.floor(scaled_start_indicator_boxes / imageScale).astype(int), 0)
-        # Rescale results to original coordinates
-
+        start_indicator_boxes = np.append(start_indicator_boxes, np.floor(scaled_start_indicator_boxes / imageScale), 0).astype(int)
         #io.imshow(image_binary)
+
+    # Make all sorts of checks to filter out faulty boxes
+    start_indicator_boxes = filter_start_indicator_boxes_duplicates(image, start_indicator_boxes)
+    start_indicator_boxes = filter_start_indicator_boxes_whitesurround(image, start_indicator_boxes)
 
     return start_indicator_boxes
 
-#def read_ids(image, start_indicator_boxes):
+def read_ids(image, start_indicator_boxes):
     # Reads the ID values, filters IDs which do not pass the CRC checks
-#    for boxID in range (start_indicator_boxes.shape[0]):
+    for boxID in range (start_indicator_boxes.shape[0]):
+        startBox = start_indicator_boxes[boxID]
+        boxStartX = startBox[0]
+        boxStartY = startBox[1]
+        boxEndX = startBox[2]
+        boxEndY = startBox[3]
+        boxMidX = startBox[4]
+        boxMidY = startBox[5]
+        boxWidth = startBox[6]
+        boxHeight = startBox[7]
+        idBitWidth = startBox[8]
+
 
 
 
@@ -213,7 +239,7 @@ def locate_ids(image):
 
         
 # Read image
-filename = os.path.join("./Samples/", "20190824_105109.jpg")
+filename = os.path.join("./Samples/", "20190824_105242.jpg")
 image_orig = io.imread(filename)
 image = image_orig
 
@@ -224,8 +250,8 @@ image = rgb2gray(image)
 v_min, v_max = np.percentile(image, (0.2, 99.8))
 image = exposure.rescale_intensity(image, in_range=(v_min, v_max))
 
-# image_convolved = locate_ids(image)
 id_locations = locate_ids(image)
+ids = read_ids(image, id_locations)
 
 image_filtered = image
 image_filtered = np.where(image_filtered < 0.20, 0, image_filtered)
