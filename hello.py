@@ -13,20 +13,40 @@ from skimage import data, filters, io, feature, exposure, measure
 from skimage.color import rgb2gray
 from skimage.filters import threshold_otsu
 from skimage.transform import rescale
+import skimage.draw
 
 from skimage.exposure import rescale_intensity
 import argparse
 import cv2
 import matplotlib.patches as patches
 from PIL import Image
+from scipy.spatial import distance
 
+
+def output_debug_image(image, boxes, name):
+    if __debug__:
+        filename = os.path.join("./Debug/", inspect.currentframe().f_code.co_name + " - " + name + ".jpg")
+        debugImage = np.copy(image)
+        if len(boxes) != 0:
+            if boxes[0].shape == ():
+                box = boxes
+                debugImage = cv2.rectangle(debugImage, (box[0], box[1]), (box[2], box[3]), (255, 255, 255), 1)
+            else:
+                for boxIndex in range(boxes.shape[0]):
+                    box = boxes[boxIndex]
+                    debugImage = cv2.rectangle(debugImage, (box[0], box[1]), (box[2], box[3]), (255, 255, 255), 1)
+        io.imsave(filename, debugImage)
 
 def convolve(image, kernel, cutoff):
     output = signal.convolve2d(image, kernel, boundary='symm', mode='same')
 
     # Set values between 0 - 1
+    min = cutoff
     max = np.amax(output)
-    min = np.amin(output)
+    if max < min:
+        output = 0
+        return output
+    # min = np.amin(output)
     range = max - min
     if min < 0 :
         output = output - min
@@ -35,10 +55,12 @@ def convolve(image, kernel, cutoff):
 
     output = (output - min) / range
 
+    output = np.where(output < 0, 0, output)
+
     # Only keep the extreme findings
-    if (cutoff > 0):
-        output = np.where(output < cutoff, 0, output)
-        output = np.where(output >= cutoff, 1, output)
+    # if (cutoff > 0):
+    #     output = np.where(output < cutoff, 0, output)
+    #     output = np.where(output >= cutoff, 1, output)
  
 	# return the output image
     return output
@@ -52,7 +74,7 @@ def find_top_left_start_candidates(image):
         [ 35,      35,        15,      15,      15],
     ), dtype="int")
 
-    image = convolve(image, kernel, 0.8)
+    image = convolve(image, kernel, 270)
 
     if __debug__:
         filename = os.path.join("./Debug/", inspect.currentframe().f_code.co_name + " - " + str(image.shape[0]) + "x" + str(image.shape[1]) + "TopLeftBlackCornerDetection.jpg")
@@ -65,7 +87,7 @@ def find_top_left_start_candidates(image):
         [0,     -5,      -5],
     ), dtype="int")
 
-    image = convolve(image, kernel, 0.85)
+    image = convolve(image, kernel, 3)
 
     if __debug__:
         filename = os.path.join("./Debug/", inspect.currentframe().f_code.co_name + " - " + str(image.shape[0]) + "x" + str(image.shape[1]) + "TopLeftPixelStartDetection.jpg")
@@ -74,7 +96,7 @@ def find_top_left_start_candidates(image):
         
 
     # Find possible starting locations
-    indices = np.where(image == 1)
+    indices = np.where(image > 0.5)
 
     # Tuning param, the kernels seem to begin too early
     indices[0][:] = indices[0][:] + 2
@@ -151,11 +173,14 @@ def filter_start_indicator_boxes_duplicates(image, start_indicator_boxes):
         if np.any(abs(filtered_boxes[np.where(abs(filtered_boxes[:, 0] - startX) < 15), 1] - startY) < 15) == False:
             filtered_boxes = np.append(filtered_boxes, checkBox.reshape((1, start_indicator_boxes.shape[1])), 0)
 
+    if __debug__:
+        output_debug_image(image, filtered_boxes[:, (0, 1, 2, 3)], "StartBoxesAfterDuplicateFiltering")
+
     return filtered_boxes
 
 def filter_start_indicator_boxes_whitesurround(image, start_indicator_boxes):
     # Tests the start indicator boxes against the expected shape of the start indicator and filters out incorrect candidates
-    brightnessCutoff = 0.75
+    brightnessCutoff = 0.6
     acceptableIDs = []
     imageWidth = image.shape[1]
     imageHeight = image.shape[0]
@@ -168,19 +193,12 @@ def filter_start_indicator_boxes_whitesurround(image, start_indicator_boxes):
         bitWidth = start_indicator_boxes[boxID, 8]
         bitHalfWidth = math.floor(bitWidth * 0.5)
         # Check image size restrictions
-        if idEndX + (bitWidth * 13) >= imageWidth or idStartX - (idWidth * 2) < 0 or midY - (idHeight * 3) < 0 or midY + (idHeight * 3) >= imageHeight:
+        if idEndX + (bitWidth * 2) >= imageWidth or idStartX - (idWidth * 2) < 0 or midY - (idHeight * 3) < 0 or midY + (idHeight * 3) >= imageHeight:
             continue
         # Check white area right of start indicator box
         startX = idEndX + bitHalfWidth - math.floor(bitWidth / 3)
         startY = midY - math.floor(idWidth / 3)
         endX = idEndX + bitHalfWidth + math.floor(bitWidth / 3)
-        endY = midY + math.floor(idWidth / 3)
-        if mean_pixel_intensity(image, startX, startY, endX, endY) < brightnessCutoff:
-            continue
-        # Check white area 2x right of start indicator box
-        startX = idEndX + bitWidth + bitHalfWidth - math.floor(bitWidth / 3)
-        startY = midY - math.floor(idWidth / 3)
-        endX = idEndX + bitWidth + bitHalfWidth + math.floor(bitWidth / 3)
         endY = midY + math.floor(idWidth / 3)
         if mean_pixel_intensity(image, startX, startY, endX, endY) < brightnessCutoff:
             continue
@@ -194,7 +212,40 @@ def filter_start_indicator_boxes_whitesurround(image, start_indicator_boxes):
 
         acceptableIDs.append(boxID)
 
+    if __debug__:
+        if len(acceptableIDs) > 0:
+            output_debug_image(image, start_indicator_boxes[acceptableIDs][:, (0, 1, 2, 3)], "StartBoxesAfterWhitesurroundFiltering")
+        else:
+            output_debug_image(image, [], "StartBoxesAfterWhitesurroundFiltering")
+
     return start_indicator_boxes[acceptableIDs]
+
+def filter_start_indicator_boxes_start_end_correlation(image, start_indicator_boxes):
+    acceptableBoxes = []
+
+    for boxID in range (start_indicator_boxes.shape[0]):
+        startBox = start_indicator_boxes[boxID]
+        idStartX = startBox[0]
+        idEndX = startBox[2]
+        idWidth = startBox[6]
+        midY = startBox[5]
+        idHeight = startBox[7]
+        bitWidth = startBox[8]
+        boxWidth = startBox[6]
+        minDistance = boxWidth * 6
+        maxDistance = boxWidth * 14
+        distances = np.linalg.norm(start_indicator_boxes[:, (4, 5)] - startBox[4:6], axis=1)
+        if np.any(distances[np.where(distances <= maxDistance)] >= minDistance) == True:
+            acceptableBoxes.append(startBox)
+
+    acceptableBoxes = np.array(acceptableBoxes)
+
+    if __debug__:
+        if len(acceptableBoxes) > 0:
+            output_debug_image(image, acceptableBoxes[:, (0, 1, 2, 3)], "StartBoxesAfterStartEndCorrelationFiltering")
+        else:
+            output_debug_image(image, (), "StartBoxesAfterStartEndCorrelationFiltering")
+    return np.array(acceptableBoxes)
 
 def locate_ids(image):
     # The convolution kernels are only good for IDs of a certain size range. Scale down a few times for better results.
@@ -212,9 +263,13 @@ def locate_ids(image):
         start_indicator_boxes = np.append(start_indicator_boxes, np.floor(scaled_start_indicator_boxes / imageScale), 0).astype(int)
         #io.imshow(image_binary)
 
+    if __debug__:
+        output_debug_image(image, start_indicator_boxes[:, (0, 1, 2, 3)], "StartBoxesBeforeFiltering")
+
     # Make all sorts of checks to filter out faulty boxes
     start_indicator_boxes = filter_start_indicator_boxes_duplicates(image, start_indicator_boxes)
     start_indicator_boxes = filter_start_indicator_boxes_whitesurround(image, start_indicator_boxes)
+    start_indicator_boxes = filter_start_indicator_boxes_start_end_correlation(image, start_indicator_boxes)
 
     return start_indicator_boxes
 
@@ -239,7 +294,7 @@ def read_ids(image, start_indicator_boxes):
 
         
 # Read image
-filename = os.path.join("./Samples/", "20190824_105242.jpg")
+filename = os.path.join("./Samples/", "OnlyID.jpg")
 image_orig = io.imread(filename)
 image = image_orig
 
